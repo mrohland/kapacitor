@@ -136,7 +136,104 @@ func (s *Service) Alert(teams []string, recipients []string, level alert.Level, 
 		dec.Decode(r)
 		return fmt.Errorf("opsgenie error: %s", r.Message)
 	}
+	
+	if level != alert.OK {
+		s.updateMessage(message, entityID)
+		s.updatePriority(level, entityID)
+		s.updateDescription(details, entityID)
+	}
 	return nil
+}
+
+func (s *Service) updateMessage(message, entityID string) error {
+	s.update(message, entityID, "message")
+	return nil
+}
+
+func (s *Service) updatePriority(level alert.Level, entityID string) error {
+	var priority string
+	switch level {
+	case alert.Info:
+		priority = "P5"
+	case alert.Warning:
+		priority = "P3"
+	case alert.Critical:
+		priority = "P1"
+	}
+	s.update(priority, entityID, "priority")
+	return nil
+}
+
+func (s *Service) updateDescription(details models.Result, entityID string) error {
+	b, err := json.Marshal(details)
+	if err != nil {
+		return err
+	}
+	s.update(string(b), entityID, "description")
+	return nil
+}
+
+func (s *Service) update(message, entityID string, action string) error {
+	req, err := s.prepareUpdate(message, entityID, action)
+	if err != nil {
+		return errors.Wrap(err, "failed to prepare API request")
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return errors.Wrap(err, "failed to execute API request")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return errors.Wrap(err, "failed to read API response")
+		}
+		type response struct {
+			Message string `json:"message"`
+		}
+		r := &response{Message: fmt.Sprintf("failed to understand OpsGenie response. code: %d content: %s", resp.StatusCode, string(body))}
+		b := bytes.NewReader(body)
+		dec := json.NewDecoder(b)
+		dec.Decode(r)
+		return fmt.Errorf("opsgenie error: %s", r.Message)
+	}
+	return nil
+}
+
+func (s *Service) prepareUpdate(content, entityID string, action string) (*http.Request, error) {
+	c := s.config()
+	if !c.Enabled {
+		return nil, errors.New("service is not enabled")
+	}
+
+	alias := base64.URLEncoding.EncodeToString([]byte(entityID))
+
+	ogData := make(map[string]interface{})
+	u := c.URL
+	updateURL, err := url.Parse(c.URL)
+	if err != nil {
+		return nil, err
+	}
+	updateURL.Path = path.Join(updateURL.Path, alias, action)
+	updateURL.RawQuery = "identifierType=alias"
+	u = updateURL.String()
+	ogData[action] = content
+
+	var post bytes.Buffer
+	enc := json.NewEncoder(&post)
+	if err := enc.Encode(ogData); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", u, &post)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "GenieKey "+c.APIKey)
+
+	return req, nil
 }
 
 func (s *Service) preparePost(teams []string, recipients []string, level alert.Level, message, entityID string, t time.Time, details models.Result) (*http.Request, error) {
